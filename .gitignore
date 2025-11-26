@@ -1,0 +1,14 @@
+ # OS files
+ .DS_Store
+
+ # Python cache
+ __pycache__/
+ *.pyc
+
+ # Virtual environments
+ venv/
+
+ # Data files
+ *.csv
+
+
