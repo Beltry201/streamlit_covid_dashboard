@@ -64,6 +64,8 @@ TABLE_DATA = _load_table()
 
 st.set_page_config(layout="wide")
 
+DECLINE_END_DATE = pd.Timestamp('2024-12-31')
+
 
 @st.cache_data
 def get_global_timeseries(df: pd.DataFrame) -> pd.DataFrame:
@@ -225,8 +227,6 @@ weekly_spread = get_weekly_spread(DAILY_DATA)
 reaction_delay = get_reaction_delay(DAILY_DATA, TABLE_DATA)
 post2022_ts = get_post2022_timeseries(global_ts)
 country_weekly_rates = get_country_weekly_rates(DAILY_DATA, TABLE_DATA)
-negative_trends = get_negative_trends(country_weekly_rates)
-stabilization_metrics = get_stabilization_metrics(country_weekly_rates)
 
 darkest_day = global_ts.loc[global_ts['New_cases'].idxmax()]
 darkest_growth_pct = darkest_day['daily_growth_pct']
@@ -236,22 +236,41 @@ latest_growth = latest_totals['daily_growth_pct']
 recent_growth_avg = global_ts['daily_growth_pct'].tail(7).mean()
 peak_growth_row = global_ts.loc[global_ts['daily_growth_pct'].idxmax()]
 
-latest_week = country_weekly_rates['week'].max()
-region_options = sorted(country_weekly_rates['WHO_region'].dropna().unique().tolist())
+decline_start = darkest_day['Date_reported']
+decline_end = min(DECLINE_END_DATE, global_ts['Date_reported'].max())
+decline_window_label = f"{decline_start:%b %d, %Y} → {decline_end:%b %d, %Y}"
 
-if not post2022_ts.empty:
-  post2022_latest = post2022_ts.iloc[-1]
-  rolling_threshold = post2022_ts['rolling30_cases'].quantile(0.75)
-  recent_spikes = post2022_ts[
-    post2022_ts['rolling30_cases'] >= rolling_threshold
+post_peak_ts = post2022_ts[
+  (post2022_ts['Date_reported'] >= decline_start) &
+  (post2022_ts['Date_reported'] <= decline_end)
+].copy()
+
+section2_weekly_rates = country_weekly_rates[
+  (country_weekly_rates['week'] >= decline_start) &
+  (country_weekly_rates['week'] <= decline_end)
+].copy()
+
+negative_trends = get_negative_trends(section2_weekly_rates)
+stabilization_metrics = get_stabilization_metrics(section2_weekly_rates)
+
+section2_latest_week = section2_weekly_rates['week'].max()
+region_options = sorted(section2_weekly_rates['WHO_region'].dropna().unique().tolist())
+if not region_options:
+  region_options = []
+
+if not post_peak_ts.empty:
+  post_peak_latest = post_peak_ts.iloc[-1]
+  rolling_threshold = post_peak_ts['rolling30_cases'].quantile(0.75)
+  recent_spikes = post_peak_ts[
+    post_peak_ts['rolling30_cases'] >= rolling_threshold
   ]
   last_spike_date = (
     recent_spikes['Date_reported'].max()
     if not recent_spikes.empty
-    else post2022_latest['Date_reported']
+    else post_peak_latest['Date_reported']
   )
-  days_since_spike = (post2022_latest['Date_reported'] - last_spike_date).days
-  current_cfr = post2022_latest['cfr_pct']
+  days_since_spike = (post_peak_latest['Date_reported'] - last_spike_date).days
+  current_cfr = post_peak_latest['cfr_pct']
 else:
   days_since_spike = None
   current_cfr = None
@@ -390,15 +409,44 @@ with tab_countries:
 
 st.divider()
 
-st.title("Section 2 · Transition to Endemicity")
-st.caption("Assessing where COVID-19 still circulates, who is pulling ahead with declines, and how the global system stabilizes.")
+st.title("Section 2 · From Peak to Plateau (2022–2024)")
+st.caption(
+  "Following the descent from the darkest day through late 2024 to spot lingering hotspots, sustained declines, and early signals of endemic stability."
+)
 
 with st.container():
   st.subheader("Guiding Questions")
   st.markdown(
-    "- Which countries still show high circulation (highest new cases per rate)?\n"
-    "- Which countries report negative new case rates (declines)?\n"
-    "- What signals the shift from pandemic → endemic (CFR, stabilization)?"
+    "- After the global peak, where did the virus remain stubbornly active?\n"
+    "- Which regions posted consistent week-over-week declines during 2023 Q3 – 2024 Q4?\n"
+    "- What evidence points to post-2022 stabilization (falling CFR, low-variance weeks)?"
+  )
+
+st.divider()
+
+st.subheader(f"Come-down after the peak ({decline_window_label})")
+if post_peak_ts.empty:
+  st.info("Data for the decline window is unavailable in the source file.")
+else:
+  st.markdown(
+    "The darkest day (vertical line) marked the inflection point—by tracking 30-day averages after that moment we can see how quickly the curve eased."
+  )
+  decline_area = (
+    alt.Chart(post_peak_ts)
+    .mark_area(color="#bde0fe")
+    .encode(
+      x='Date_reported:T',
+      y=alt.Y('rolling30_cases:Q', title='30-day average new cases'),
+    )
+  )
+  peak_marker = (
+    alt.Chart(pd.DataFrame({'Date_reported': [decline_start]}))
+    .mark_rule(color="#e63946", strokeDash=[6, 4])
+    .encode(x='Date_reported:T')
+  )
+  st.altair_chart(decline_area + peak_marker, use_container_width=True)
+  st.caption(
+    "Narrative focus: document the slope of the decline through 2024 to contextualize the subsequent tabs."
   )
 
 st.divider()
@@ -415,11 +463,11 @@ with tab_high:
     default=region_options,
     help="Filter the ranking to WHO regions of interest.",
   )
-  if pd.isna(latest_week):
-    st.info("Weekly aggregates unavailable for high-circulation ranking.")
+  if pd.isna(section2_latest_week):
+    st.info("Weekly aggregates unavailable for the decline window.")
   else:
-    latest_label = latest_week.strftime("%b %d, %Y")
-    latest_rates = country_weekly_rates[country_weekly_rates['week'] == latest_week]
+    latest_label = section2_latest_week.strftime("%b %d, %Y")
+    latest_rates = section2_weekly_rates[section2_weekly_rates['week'] == section2_latest_week]
     if selected_regions_high:
       latest_rates = latest_rates[latest_rates['WHO_region'].isin(selected_regions_high)]
 
@@ -477,15 +525,15 @@ with tab_decline:
   col_heat, col_lines = st.columns((2, 1))
 
   if declining.empty:
-    col_heat.info("No countries meet the consecutive-week decline rule for the selected regions.")
-  elif pd.isna(latest_week):
+    col_heat.info("No countries meet the consecutive-week decline rule within the decline window.")
+  elif pd.isna(section2_latest_week):
     col_heat.info("Weekly aggregates unavailable for decline tracking.")
   else:
     heatmap_countries = declining.sort_values('slope').head(8)['Country'].tolist()
-    heatmap_start = latest_week - pd.Timedelta(weeks=6)
-    heatmap_df = country_weekly_rates[
-      (country_weekly_rates['Country'].isin(heatmap_countries)) &
-      (country_weekly_rates['week'] >= heatmap_start)
+    heatmap_start = section2_latest_week - pd.Timedelta(weeks=6)
+    heatmap_df = section2_weekly_rates[
+      (section2_weekly_rates['Country'].isin(heatmap_countries)) &
+      (section2_weekly_rates['week'] >= heatmap_start)
     ]
     heatmap = (
       alt.Chart(heatmap_df)
@@ -505,9 +553,9 @@ with tab_decline:
     col_heat.altair_chart(heatmap, use_container_width=True)
 
     line_countries = declining.sort_values('slope').head(3)['Country'].tolist()
-    line_df = country_weekly_rates[
-      (country_weekly_rates['Country'].isin(line_countries)) &
-      (country_weekly_rates['week'] >= heatmap_start)
+    line_df = section2_weekly_rates[
+      (section2_weekly_rates['Country'].isin(line_countries)) &
+      (section2_weekly_rates['week'] >= heatmap_start)
     ]
     lines = (
       alt.Chart(line_df)
@@ -536,12 +584,12 @@ with tab_stable:
     help="Cumulative deaths / cumulative cases, post-2022 view.",
   )
 
-  if post2022_ts.empty:
-    chart_col.info("Post-2022 slice unavailable for CFR comparison.")
+  if post_peak_ts.empty:
+    chart_col.info("Decline-window slice unavailable for CFR comparison.")
   else:
     cfr_cases_chart = (
       alt.layer(
-        alt.Chart(post2022_ts)
+        alt.Chart(post_peak_ts)
         .mark_line(color="#457b9d")
         .encode(
           x='Date_reported:T',
@@ -551,7 +599,7 @@ with tab_stable:
             alt.Tooltip('rolling30_cases:Q', title='30d avg cases', format=',.0f'),
           ],
         ),
-        alt.Chart(post2022_ts)
+        alt.Chart(post_peak_ts)
         .mark_line(color="#f07c15")
         .encode(
           x='Date_reported:T',
