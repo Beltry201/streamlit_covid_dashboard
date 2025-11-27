@@ -45,6 +45,21 @@ import altair as alt
 import pydeck as pdk
 
 
+PRIMARY_BLUE = "#1d4ed8"
+SECONDARY_BLUE = "#2563eb"
+TERTIARY_BLUE = "#3b82f6"
+LIGHT_BLUE = "#bfdbfe"
+BLUE_SCALE = [
+  PRIMARY_BLUE,
+  SECONDARY_BLUE,
+  TERTIARY_BLUE,
+  "#60a5fa",
+  "#93c5fd",
+  "#bfdbfe",
+]
+EXCLUDED_COUNTRIES = {"China"}
+
+
 def _load_daily() -> pd.DataFrame:
   df = pd.read_csv('WHO-COVID-19-global-daily-data.csv')
   df['Date_reported'] = pd.to_datetime(df['Date_reported'])
@@ -62,9 +77,24 @@ def _load_table() -> pd.DataFrame:
 DAILY_DATA = _load_daily()
 TABLE_DATA = _load_table()
 
+if EXCLUDED_COUNTRIES:
+  DAILY_DATA = DAILY_DATA[~DAILY_DATA['Country'].isin(EXCLUDED_COUNTRIES)].copy()
+  TABLE_DATA = TABLE_DATA[~TABLE_DATA['Country'].isin(EXCLUDED_COUNTRIES)].copy()
+
 st.set_page_config(layout="wide")
 
 DECLINE_END_DATE = pd.Timestamp('2024-12-31')
+SECTION_TITLES = (
+  "Section 1 · The Outbreak & Crisis Phase",
+  "Section 2 · From Peak to Plateau (2022–2024)",
+)
+PROJECTION_DAYS = 20
+MIN_PROJECTION_GROWTH = 0.5
+MAX_PROJECTION_GROWTH = 3
+DECLINE_ANNOTATION = (
+  "After the global peak on January 30, 2022, cases dropped by over 80% in just four months.\n"
+  "Without intervention, that curve would have continued rising exponentially."
+)
 
 
 @st.cache_data
@@ -93,21 +123,7 @@ def get_weekly_spread(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data
-def get_reaction_delay(df: pd.DataFrame, metadata: pd.DataFrame) -> pd.DataFrame:
-  first_cases = (
-    df[df['New_cases'] > 0]
-    .groupby('Country', as_index=False)['Date_reported']
-    .min()
-    .rename(columns={'Date_reported': 'first_case'})
-  )
-  baseline = df['Date_reported'].min()
-  first_cases['delay_days'] = (first_cases['first_case'] - baseline).dt.days
-  merged = first_cases.merge(metadata[['Country', 'WHO Region']], on='Country', how='left')
-  return merged
-
-
-@st.cache_data
-def build_delay_geojson(reaction_df: pd.DataFrame) -> dict:
+def build_cases_geojson(metadata: pd.DataFrame) -> dict:
   import json
   from urllib.request import urlopen
 
@@ -115,21 +131,58 @@ def build_delay_geojson(reaction_df: pd.DataFrame) -> dict:
   with urlopen(url) as response:
     geojson = json.load(response)
 
-  delay_map = reaction_df.set_index('Country')['delay_days'].to_dict()
+  data = metadata.copy()
+  data['total_cases'] = pd.to_numeric(
+    data['Cases - cumulative total'], errors='coerce'
+  ).fillna(0)
+  data['cases_per_100k'] = pd.to_numeric(
+    data['Cases - cumulative total per 100000 population'], errors='coerce'
+  ).fillna(0)
+  stats = data[['Country', 'total_cases', 'cases_per_100k']].set_index('Country').to_dict('index')
+
+  max_rate = max((info['cases_per_100k'] for info in stats.values()), default=0)
+  max_log_rate = np.log1p(max_rate) if max_rate > 0 else 0
+  base_rgba = np.array([220, 233, 255, 60])
+  peak_rgba = np.array([15, 76, 146, 220])
 
   for feature in geojson['features']:
     name = feature['properties'].get('name')
-    delay = delay_map.get(name)
-    if delay is None or np.isnan(delay):
-      feature['properties']['delay_days'] = None
-      feature['properties']['color'] = [200, 200, 200, 120]
+    info = stats.get(name)
+    if not info or info['total_cases'] <= 0:
+      feature['properties']['cases_total'] = None
+      feature['properties']['cases_per_100k'] = None
+      feature['properties']['fill_color'] = [220, 220, 220, 60]
       continue
 
-    clipped = max(0, min(120, int(delay)))
-    feature['properties']['delay_days'] = int(delay)
-    feature['properties']['color'] = [255 - clipped, 100 + clipped // 2, 90, 180]
+    rate = info['cases_per_100k']
+    if rate <= 0 or max_log_rate == 0:
+      intensity = 0
+    else:
+      intensity = np.log1p(rate) / max_log_rate
+    color = (base_rgba + (peak_rgba - base_rgba) * intensity).astype(int).tolist()
+
+    feature['properties']['cases_total'] = int(info['total_cases'])
+    feature['properties']['cases_per_100k'] = float(rate)
+    feature['properties']['fill_color'] = color
 
   return geojson
+
+
+def build_no_action_projection(
+  start_cases: float,
+  start_date: pd.Timestamp,
+  daily_growth_pct: float,
+  days: int = PROJECTION_DAYS,
+) -> pd.DataFrame:
+  if pd.isna(start_cases) or start_cases <= 0:
+    return pd.DataFrame(columns=['Date_reported', 'Projected_cases'])
+
+  growth_pct = np.clip(daily_growth_pct, MIN_PROJECTION_GROWTH, MAX_PROJECTION_GROWTH)
+  growth = growth_pct / 100
+  horizons = np.arange(days)
+  projected_cases = start_cases * np.power(1 + growth, horizons)
+  dates = pd.date_range(start=start_date, periods=days, freq='D')
+  return pd.DataFrame({'Date_reported': dates, 'Projected_cases': projected_cases})
 
 
 @st.cache_data
@@ -224,9 +277,9 @@ def get_stabilization_metrics(weekly_rates: pd.DataFrame) -> pd.DataFrame:
 global_ts = get_global_timeseries(DAILY_DATA)
 country_peaks = get_country_peaks(DAILY_DATA)
 weekly_spread = get_weekly_spread(DAILY_DATA)
-reaction_delay = get_reaction_delay(DAILY_DATA, TABLE_DATA)
 post2022_ts = get_post2022_timeseries(global_ts)
 country_weekly_rates = get_country_weekly_rates(DAILY_DATA, TABLE_DATA)
+cases_geojson = build_cases_geojson(TABLE_DATA)
 
 darkest_day = global_ts.loc[global_ts['New_cases'].idxmax()]
 darkest_growth_pct = darkest_day['daily_growth_pct']
@@ -235,6 +288,17 @@ latest_totals = global_ts.iloc[-1]
 latest_growth = latest_totals['daily_growth_pct']
 recent_growth_avg = global_ts['daily_growth_pct'].tail(7).mean()
 peak_growth_row = global_ts.loc[global_ts['daily_growth_pct'].idxmax()]
+no_action_projection = build_no_action_projection(
+  start_cases=darkest_day['New_cases'],
+  start_date=darkest_day['Date_reported'],
+  daily_growth_pct=darkest_growth_pct,
+  days=PROJECTION_DAYS,
+)
+annotation_date = min(
+  global_ts['Date_reported'].max(),
+  darkest_day['Date_reported'] + pd.Timedelta(days=120),
+)
+annotation_level = float(darkest_day['New_cases']) * 0.55
 
 decline_start = darkest_day['Date_reported']
 decline_end = min(DECLINE_END_DATE, global_ts['Date_reported'].max())
@@ -275,362 +339,398 @@ else:
   days_since_spike = None
   current_cfr = None
 
-st.title("Section 1 · The Outbreak & Crisis Phase")
-st.caption("Tracking how fast COVID-19 spread, how authorities reacted, and when the crisis peaked.")
 
-with st.container():
-  st.subheader("Guiding Questions")
-  st.markdown(
-    "- How fast was COVID spreading per country and which countries were hit the hardest?\n"
-    "- How fast did authorities react (delay until the first reported case)?\n"
-    "- Which day recorded the worst global caseload?\n"
-    "- What would the curve look like without vaccinations?"
-  )
+def render_section_one():
+  st.title(SECTION_TITLES[0])
+  st.caption("Tracking how fast COVID-19 spread, how authorities reacted, and when the crisis peaked.")
 
-st.divider()
-
-metric_cols = st.columns(4)
-metric_cols[0].metric(
-  "Total reported cases",
-  f"{int(latest_totals['cumulative_cases']):,}",
-  help="Global cumulative cases through the end of the dataset.",
-)
-metric_cols[1].metric(
-  "Darkest day · new cases",
-  f"{int(darkest_day['New_cases']):,}",
-  f"{darkest_day['Date_reported'].date()}",
-  help="Date with the highest global daily cases.",
-)
-metric_cols[2].metric(
-  "Countries reporting cases",
-  f"{total_countries}",
-  help="Number of unique territories with at least one reported infection.",
-)
-metric_cols[3].metric(
-  "Darkest-day growth",
-  f"{darkest_growth_pct:.1f}%",
-  f"{darkest_day['Date_reported'].date():%b %d}",
-  help="Percent change in new cases vs the day before the worst-case spike.",
-)
-
-st.divider()
-
-tab_timeline, tab_countries = st.tabs(["Crisis Timeline", "Country Comparisons"])
-
-with tab_timeline:
-  st.subheader("Global new cases")
-  base = alt.Chart(global_ts).properties(height=350)
-  line_cases = base.mark_line(color="#e63946", strokeWidth=2).encode(
-    x='Date_reported:T',
-    y=alt.Y('New_cases:Q', title='New cases'),
-    tooltip=[
-      alt.Tooltip('Date_reported:T', title='Date'),
-      alt.Tooltip('New_cases:Q', title='New cases', format=','),
-      alt.Tooltip('rolling_avg_cases:Q', title='7d avg', format=',.0f'),
-    ],
-  )
-  rolling_line = base.mark_line(color="#1d3557", strokeDash=[4, 4]).encode(
-    x='Date_reported:T',
-    y='rolling_avg_cases:Q',
-  )
-  st.altair_chart(line_cases + rolling_line, use_container_width=True)
-
-  st.subheader("No-vaccine spread simulation")
-  col_left, col_right = st.columns([1, 2])
-  with col_left:
-    initial_cases = col_left.number_input("Initial cases", value=1000, min_value=1)
-    daily_growth = col_left.slider("Daily growth (%)", min_value=-5.0, max_value=15.0, value=4.0, step=0.5)
-    horizon = col_left.slider("Days simulated", min_value=30, max_value=365, value=120, step=10)
-
-  days = np.arange(horizon)
-  trajectory = initial_cases * np.power(1 + daily_growth / 100, days)
-  sim_df = pd.DataFrame({'Day': days, 'Projected_cases': trajectory})
-  sim_chart = alt.Chart(sim_df).mark_line(color="#06d6a0").encode(
-    x='Day:Q',
-    y=alt.Y('Projected_cases:Q', title='Projected cases'),
-    tooltip=['Day:Q', alt.Tooltip('Projected_cases:Q', format=',')],
-  )
-  col_right.altair_chart(sim_chart, use_container_width=True)
-
-with tab_countries:
-  st.subheader("Country-level pressure")
-  col_a, col_b = st.columns((2, 1))
-
-  top_country_names = country_peaks.head(10)['Country'].tolist()
-  default_selected = top_country_names[:4]
-  selected_countries = col_a.multiselect(
-    "Compare countries",
-    top_country_names,
-    default=default_selected,
-    help="Derived from countries with the highest recorded single-day spikes.",
-  )
-
-  if selected_countries:
-    filtered = weekly_spread[weekly_spread['Country'].isin(selected_countries)]
-    spread_chart = alt.Chart(filtered).mark_line().encode(
-      x='week:T',
-      y=alt.Y('New_cases:Q', title='Weekly new cases'),
-      color='Country:N',
-      tooltip=['Country:N', 'week:T', alt.Tooltip('New_cases:Q', format=',')],
-    ).properties(height=300)
-    col_a.altair_chart(spread_chart, use_container_width=True)
-  else:
-    col_a.info("Select at least one country to display weekly trends.")
-
-  geojson = build_delay_geojson(reaction_delay)
-  delay_layer = pdk.Layer(
-    "GeoJsonLayer",
-    data=geojson,
-    pickable=True,
-    stroked=True,
-    get_line_color=[255, 255, 255],
-    get_fill_color='properties.color',
-    auto_highlight=True,
-  )
-  deck = pdk.Deck(
-    layers=[delay_layer],
-    initial_view_state=pdk.ViewState(latitude=10, longitude=0, zoom=0.8),
-    map_style=None,
-    tooltip={"html": "<b>{name}</b><br/>Delay: {delay_days} days", "style": {"color": "white"}},
-  )
-  col_b.pydeck_chart(deck)
-
-  st.subheader("Darkest day per country")
-  peaks_chart = alt.Chart(country_peaks.head(20)).mark_bar(color="#ffba08").encode(
-    x=alt.X('New_cases:Q', title='Peak new cases'),
-    y=alt.Y('Country:N', sort='-x'),
-    tooltip=[
-      'Country:N',
-      alt.Tooltip('New_cases:Q', format=',', title='Peak cases'),
-      alt.Tooltip('Date_reported:T', title='Date'),
-    ],
-  ).properties(height=500)
-  st.altair_chart(peaks_chart, use_container_width=True)
-
-st.divider()
-
-st.title("Section 2 · From Peak to Plateau (2022–2024)")
-st.caption(
-  "Following the descent from the darkest day through late 2024 to spot lingering hotspots, sustained declines, and early signals of endemic stability."
-)
-
-with st.container():
-  st.subheader("Guiding Questions")
-  st.markdown(
-    "- After the global peak, where did the virus remain stubbornly active?\n"
-    "- Which regions posted consistent week-over-week declines during 2023 Q3 – 2024 Q4?\n"
-    "- What evidence points to post-2022 stabilization (falling CFR, low-variance weeks)?"
-  )
-
-st.divider()
-
-st.subheader(f"Come-down after the peak ({decline_window_label})")
-if post_peak_ts.empty:
-  st.info("Data for the decline window is unavailable in the source file.")
-else:
-  st.markdown(
-    "The darkest day (vertical line) marked the inflection point—by tracking 30-day averages after that moment we can see how quickly the curve eased."
-  )
-  decline_area = (
-    alt.Chart(post_peak_ts)
-    .mark_area(color="#bde0fe")
-    .encode(
-      x='Date_reported:T',
-      y=alt.Y('rolling30_cases:Q', title='30-day average new cases'),
+  with st.container():
+    st.subheader("Guiding Questions")
+    st.markdown(
+      "- How fast was COVID spreading per country and which countries were hit the hardest?\n"
+      "- How fast did authorities react (delay until the first reported case)?\n"
+      "- Which day recorded the worst global caseload?\n"
+      "- What would the curve look like without vaccinations?"
     )
+
+  st.divider()
+
+  metric_cols = st.columns(3)
+  metric_cols[0].metric(
+    "Total reported cases",
+    f"{int(latest_totals['cumulative_cases']):,}",
+    help="Global cumulative cases through the end of the dataset.",
   )
-  peak_marker = (
-    alt.Chart(pd.DataFrame({'Date_reported': [decline_start]}))
-    .mark_rule(color="#e63946", strokeDash=[6, 4])
-    .encode(x='Date_reported:T')
+  metric_cols[1].metric(
+    "Darkest day · new cases",
+    f"{int(darkest_day['New_cases']):,}",
+    f"{darkest_day['Date_reported'].date()}",
+    help="Date with the highest global daily cases.",
   )
-  st.altair_chart(decline_area + peak_marker, use_container_width=True)
-  st.caption(
-    "Narrative focus: document the slope of the decline through 2024 to contextualize the subsequent tabs."
+  metric_cols[2].metric(
+    "Darkest-day growth",
+    f"{darkest_growth_pct:.1f}%",
+    f"{darkest_day['Date_reported'].date():%b %d}",
+    help="Percent change in new cases vs the day before the worst-case spike.",
   )
 
-st.divider()
+  st.divider()
 
-tab_high, tab_decline, tab_stable = st.tabs(
-  ["High circulation", "Declining signals", "Stabilization"]
-)
+  tab_timeline, tab_countries = st.tabs(["Crisis Timeline", "Country Comparisons"])
 
-with tab_high:
-  st.subheader("Where circulation remains high")
-  selected_regions_high = st.multiselect(
-    "Focus regions",
-    options=region_options,
-    default=region_options,
-    help="Filter the ranking to WHO regions of interest.",
-  )
-  if pd.isna(section2_latest_week):
-    st.info("Weekly aggregates unavailable for the decline window.")
-  else:
-    latest_label = section2_latest_week.strftime("%b %d, %Y")
-    latest_rates = section2_weekly_rates[section2_weekly_rates['week'] == section2_latest_week]
-    if selected_regions_high:
-      latest_rates = latest_rates[latest_rates['WHO_region'].isin(selected_regions_high)]
-
-    col_metrics, col_chart = st.columns((1, 2))
-    top_rates = latest_rates.dropna(subset=['cases_per_100k']).nlargest(10, 'cases_per_100k')
-
-    if not top_rates.empty:
-      avg_top5 = top_rates.head(5)['cases_per_100k'].mean()
-      col_metrics.metric(
-        "Avg top-5 rate (/100k)",
-        f"{avg_top5:.1f}",
-        help=f"Average weekly incidence among the five hottest spots ({latest_label}).",
-      )
-      col_metrics.metric(
-        "Regions represented",
-        f"{top_rates['WHO_region'].nunique()}",
-        help="Distinct WHO regions in the top-10 ranking.",
-      )
-
-      high_chart = (
-        alt.Chart(top_rates)
-        .mark_bar(color="#e36414")
+  with tab_timeline:
+    st.subheader("Global new cases")
+    base = alt.Chart(global_ts).properties(height=350)
+    layers = []
+    if not no_action_projection.empty:
+      projection_chart = (
+        alt.Chart(no_action_projection.rename(columns={'Projected_cases': 'New_cases'}))
+        .mark_line(color="#ef4444", strokeDash=[3, 3], strokeWidth=2)
         .encode(
-          x=alt.X('cases_per_100k:Q', title='Weekly new cases per 100k'),
-          y=alt.Y('Country:N', sort='-x'),
-          color='WHO_region:N',
+          x='Date_reported:T',
+          y=alt.Y('New_cases:Q', title='New cases'),
           tooltip=[
-            'Country:N',
-            alt.Tooltip('cases_per_100k:Q', title='Rate (/100k)', format='.1f'),
-            alt.Tooltip('New_cases:Q', title='Weekly cases', format=','),
-            'WHO_region:N',
+            alt.Tooltip('Date_reported:T', title='Date'),
+            alt.Tooltip('New_cases:Q', title='Projected cases', format=','),
           ],
         )
-        .properties(height=350, title=f"Top circulation · week of {latest_label}")
       )
-      col_chart.altair_chart(high_chart, use_container_width=True)
-    else:
-      col_chart.info("No weekly data available for the selected region(s).")
+      layers.append(projection_chart)
 
-with tab_decline:
-  st.subheader("Sustained declines in new cases")
-  selected_regions_decline = st.multiselect(
-    "Highlight declines in regions",
-    options=region_options,
-    default=region_options,
-    key="decline_regions",
-  )
-  declining = negative_trends[
-    (negative_trends['is_declining']) &
-    (
-      negative_trends['WHO_region'].isin(selected_regions_decline)
-      if selected_regions_decline else True
+    line_cases = base.mark_line(color=PRIMARY_BLUE, strokeWidth=2).encode(
+      x='Date_reported:T',
+      y=alt.Y('New_cases:Q', title='New cases'),
+      tooltip=[
+        alt.Tooltip('Date_reported:T', title='Date'),
+        alt.Tooltip('New_cases:Q', title='New cases', format=','),
+        alt.Tooltip('rolling_avg_cases:Q', title='7d avg', format=',.0f'),
+      ],
     )
-  ]
-  col_heat, col_lines = st.columns((2, 1))
+    rolling_line = base.mark_line(color=SECONDARY_BLUE, strokeDash=[4, 4]).encode(
+      x='Date_reported:T',
+      y='rolling_avg_cases:Q',
+    )
+    layers.extend([line_cases, rolling_line])
 
-  if declining.empty:
-    col_heat.info("No countries meet the consecutive-week decline rule within the decline window.")
-  elif pd.isna(section2_latest_week):
-    col_heat.info("Weekly aggregates unavailable for decline tracking.")
-  else:
-    heatmap_countries = declining.sort_values('slope').head(8)['Country'].tolist()
-    heatmap_start = section2_latest_week - pd.Timedelta(weeks=6)
-    heatmap_df = section2_weekly_rates[
-      (section2_weekly_rates['Country'].isin(heatmap_countries)) &
-      (section2_weekly_rates['week'] >= heatmap_start)
-    ]
-    heatmap = (
-      alt.Chart(heatmap_df)
-      .mark_rect()
-      .encode(
-        x=alt.X('week:T', title='Week'),
-        y=alt.Y('Country:N', sort=heatmap_countries),
-        color=alt.Color('cases_per_100k:Q', title='Rate (/100k)', scale=alt.Scale(scheme='blues')),
-        tooltip=[
-          'Country:N',
-          alt.Tooltip('week:T', title='Week of'),
-          alt.Tooltip('cases_per_100k:Q', title='Rate (/100k)', format='.1f'),
-        ],
+    annotation_chart = (
+      alt.Chart(
+        pd.DataFrame(
+          {
+            'Date_reported': [annotation_date],
+            'New_cases': [annotation_level],
+            'label': [DECLINE_ANNOTATION],
+          }
+        )
       )
-      .properties(height=320, title="Weekly rates among declining countries")
-    )
-    col_heat.altair_chart(heatmap, use_container_width=True)
-
-    line_countries = declining.sort_values('slope').head(3)['Country'].tolist()
-    line_df = section2_weekly_rates[
-      (section2_weekly_rates['Country'].isin(line_countries)) &
-      (section2_weekly_rates['week'] >= heatmap_start)
-    ]
-    lines = (
-      alt.Chart(line_df)
-      .mark_line(point=True)
+      .mark_text(
+        align='left',
+        color=PRIMARY_BLUE,
+        fontSize=14,
+        fontWeight='bold',
+        lineBreak='\n',
+        dx=10,
+        dy=-10,
+      )
       .encode(
+        x='Date_reported:T',
+        y='New_cases:Q',
+        text='label',
+      )
+    )
+    layers.append(annotation_chart)
+
+    st.altair_chart(alt.layer(*layers), use_container_width=True)
+
+  with tab_countries:
+    st.subheader("Cases per country")
+    col_a, col_b = st.columns((2, 1))
+
+    top_country_names = country_peaks.head(10)['Country'].tolist()
+    default_selected = top_country_names[:4]
+    selected_countries = col_a.multiselect(
+      "Compare countries",
+      top_country_names,
+      default=default_selected,
+      help="Derived from countries with the highest recorded single-day spikes.",
+    )
+
+    if selected_countries:
+      filtered = weekly_spread[weekly_spread['Country'].isin(selected_countries)]
+      spread_chart = alt.Chart(filtered).mark_line().encode(
         x='week:T',
-        y=alt.Y('cases_per_100k:Q', title='Rate (/100k)'),
-        color='Country:N',
-        tooltip=['Country:N', 'week:T', alt.Tooltip('cases_per_100k:Q', format='.1f')],
-      )
-      .properties(height=320, title="Steepest 3 declines")
+        y=alt.Y('New_cases:Q', title='Weekly new cases'),
+        color=alt.Color('Country:N', scale=alt.Scale(range=BLUE_SCALE)),
+        tooltip=['Country:N', 'week:T', alt.Tooltip('New_cases:Q', format=',')],
+      ).properties(height=300)
+      col_a.altair_chart(spread_chart, use_container_width=True)
+    else:
+      col_a.info("Select at least one country to display weekly trends.")
+
+    cases_layer = pdk.Layer(
+      "GeoJsonLayer",
+      data=cases_geojson,
+      pickable=True,
+      stroked=True,
+      get_line_color=[255, 255, 255],
+      get_fill_color='properties.fill_color',
+      auto_highlight=True,
     )
-    col_lines.altair_chart(lines, use_container_width=True)
+    deck = pdk.Deck(
+      layers=[cases_layer],
+      initial_view_state=pdk.ViewState(latitude=10, longitude=0, zoom=0.8),
+      map_style=None,
+      tooltip={
+        "html": "<b>{name}</b><br/>Cases: {cases_total}<br/>Rate: {cases_per_100k} per 100k",
+        "style": {"color": "white"},
+      },
+    )
+    col_b.pydeck_chart(deck)
 
-with tab_stable:
-  st.subheader("Signals of stabilization")
-  metrics_col, chart_col = st.columns((1, 2))
-  metrics_col.metric(
-    "Days since last major spike",
-    f"{days_since_spike} days" if days_since_spike is not None else "n/a",
-    help="Days since global rolling 30-day cases were within the top quartile of post-2022 levels.",
-  )
-  metrics_col.metric(
-    "Current global CFR",
-    f"{current_cfr:.2f}%" if current_cfr is not None else "n/a",
-    help="Cumulative deaths / cumulative cases, post-2022 view.",
+    st.subheader("Darkest day per country")
+    peaks_chart = alt.Chart(country_peaks.head(20)).mark_bar(color=PRIMARY_BLUE).encode(
+      x=alt.X('New_cases:Q', title='Peak new cases'),
+      y=alt.Y('Country:N', sort='-x'),
+      tooltip=[
+        'Country:N',
+        alt.Tooltip('New_cases:Q', format=',', title='Peak cases'),
+        alt.Tooltip('Date_reported:T', title='Date'),
+      ],
+    ).properties(height=500)
+    st.altair_chart(peaks_chart, use_container_width=True)
+
+
+def render_section_two():
+  st.title(SECTION_TITLES[1])
+  st.caption(
+    "Following the descent from the darkest day through late 2024 to spot lingering hotspots, sustained declines, and early signals of endemic stability."
   )
 
+  with st.container():
+    st.subheader("Guiding Questions")
+    st.markdown(
+      "- After the global peak, where did the virus remain stubbornly active?\n"
+      "- Which regions posted consistent week-over-week declines during 2023 Q3 – 2024 Q4?\n"
+      "- What evidence points to post-2022 stabilization (falling CFR, low-variance weeks)?"
+    )
+
+  st.divider()
+
+  st.subheader(f"Come-down after the peak ({decline_window_label})")
   if post_peak_ts.empty:
-    chart_col.info("Decline-window slice unavailable for CFR comparison.")
+    st.info("Data for the decline window is unavailable in the source file.")
   else:
-    cfr_cases_chart = (
-      alt.layer(
-        alt.Chart(post_peak_ts)
-        .mark_line(color="#457b9d")
-        .encode(
-          x='Date_reported:T',
-          y=alt.Y('rolling30_cases:Q', title='30d avg new cases'),
-          tooltip=[
-            alt.Tooltip('Date_reported:T', title='Date'),
-            alt.Tooltip('rolling30_cases:Q', title='30d avg cases', format=',.0f'),
-          ],
-        ),
-        alt.Chart(post_peak_ts)
-        .mark_line(color="#f07c15")
-        .encode(
-          x='Date_reported:T',
-          y=alt.Y('cfr_pct:Q', title='CFR (%)', axis=alt.Axis(grid=False)),
-          tooltip=[
-            alt.Tooltip('Date_reported:T', title='Date'),
-            alt.Tooltip('cfr_pct:Q', title='CFR (%)', format='.2f'),
-          ],
-        ),
-      )
-      .resolve_scale(y='independent')
-      .properties(height=320, title="Post-2022 global cases vs CFR")
+    st.markdown(
+      "The darkest day (vertical line) marked the inflection point—by tracking 30-day averages after that moment we can see how quickly the curve eased."
     )
-    chart_col.altair_chart(cfr_cases_chart, use_container_width=True)
+    decline_area = (
+      alt.Chart(post_peak_ts)
+      .mark_area(color=LIGHT_BLUE)
+      .encode(
+        x='Date_reported:T',
+        y=alt.Y('rolling30_cases:Q', title='30-day average new cases'),
+      )
+    )
+    peak_marker = (
+      alt.Chart(pd.DataFrame({'Date_reported': [decline_start]}))
+      .mark_rule(color=PRIMARY_BLUE, strokeDash=[6, 4])
+      .encode(x='Date_reported:T')
+    )
+    st.altair_chart(decline_area + peak_marker, use_container_width=True)
+    st.caption(
+      "Narrative focus: document the slope of the decline through 2024 to contextualize the subsequent tabs."
+    )
 
-  selected_regions_stable = st.multiselect(
-    "Surface low-variance countries",
-    options=region_options,
-    default=region_options,
-    key="stable_regions",
-  )
-  stable_table = stabilization_metrics.copy()
-  if selected_regions_stable:
-    stable_table = stable_table[stable_table['WHO_region'].isin(selected_regions_stable)]
-  stable_table = stable_table.replace([np.inf, -np.inf], np.nan)
-  stable_table = stable_table.dropna(subset=['variance_index'])
-  stable_show = stable_table.nsmallest(10, 'variance_index')
+  st.divider()
 
-  st.markdown("**Most stable weekly patterns since 2022** (lower variance = flatter curve)")
-  st.dataframe(
-    stable_show[['Country', 'WHO_region', 'variance_index', 'mean_weekly']],
-    use_container_width=True,
+  tab_high, tab_decline, tab_stable = st.tabs(
+    ["High circulation", "Declining signals", "Stabilization"]
   )
+
+  with tab_high:
+    st.subheader("Where circulation remains high")
+    selected_regions_high = st.multiselect(
+      "Focus regions",
+      options=region_options,
+      default=region_options,
+      help="Filter the ranking to WHO regions of interest.",
+    )
+    if pd.isna(section2_latest_week):
+      st.info("Weekly aggregates unavailable for the decline window.")
+    else:
+      latest_label = section2_latest_week.strftime("%b %d, %Y")
+      latest_rates = section2_weekly_rates[section2_weekly_rates['week'] == section2_latest_week]
+      if selected_regions_high:
+        latest_rates = latest_rates[latest_rates['WHO_region'].isin(selected_regions_high)]
+
+      col_metrics, col_chart = st.columns((1, 2))
+      top_rates = latest_rates.dropna(subset=['cases_per_100k']).nlargest(10, 'cases_per_100k')
+
+      if not top_rates.empty:
+        avg_top5 = top_rates.head(5)['cases_per_100k'].mean()
+        col_metrics.metric(
+          "Avg top-5 rate (/100k)",
+          f"{avg_top5:.1f}",
+          help=f"Average weekly incidence among the five hottest spots ({latest_label}).",
+        )
+        col_metrics.metric(
+          "Regions represented",
+          f"{top_rates['WHO_region'].nunique()}",
+          help="Distinct WHO regions in the top-10 ranking.",
+        )
+
+        high_chart = (
+          alt.Chart(top_rates)
+          .mark_bar()
+          .encode(
+            x=alt.X('cases_per_100k:Q', title='Weekly new cases per 100k'),
+            y=alt.Y('Country:N', sort='-x'),
+            color=alt.Color('WHO_region:N', scale=alt.Scale(range=BLUE_SCALE)),
+            tooltip=[
+              'Country:N',
+              alt.Tooltip('cases_per_100k:Q', title='Rate (/100k)', format='.1f'),
+              alt.Tooltip('New_cases:Q', title='Weekly cases', format=','),
+              'WHO_region:N',
+            ],
+          )
+          .properties(height=350, title=f"Top circulation · week of {latest_label}")
+        )
+        col_chart.altair_chart(high_chart, use_container_width=True)
+      else:
+        col_chart.info("No weekly data available for the selected region(s).")
+
+  with tab_decline:
+    st.subheader("Sustained declines in new cases")
+    selected_regions_decline = st.multiselect(
+      "Highlight declines in regions",
+      options=region_options,
+      default=region_options,
+      key="decline_regions",
+    )
+    declining = negative_trends[
+      (negative_trends['is_declining']) &
+      (
+        negative_trends['WHO_region'].isin(selected_regions_decline)
+        if selected_regions_decline else True
+      )
+    ]
+    col_heat, col_lines = st.columns((2, 1))
+
+    if declining.empty:
+      col_heat.info("No countries meet the consecutive-week decline rule within the decline window.")
+    elif pd.isna(section2_latest_week):
+      col_heat.info("Weekly aggregates unavailable for decline tracking.")
+    else:
+      heatmap_countries = declining.sort_values('slope').head(8)['Country'].tolist()
+      heatmap_start = section2_latest_week - pd.Timedelta(weeks=6)
+      heatmap_df = section2_weekly_rates[
+        (section2_weekly_rates['Country'].isin(heatmap_countries)) &
+        (section2_weekly_rates['week'] >= heatmap_start)
+      ]
+      heatmap = (
+        alt.Chart(heatmap_df)
+        .mark_rect()
+        .encode(
+          x=alt.X('week:T', title='Week'),
+          y=alt.Y('Country:N', sort=heatmap_countries),
+          color=alt.Color('cases_per_100k:Q', title='Rate (/100k)', scale=alt.Scale(scheme='blues')),
+          tooltip=[
+            'Country:N',
+            alt.Tooltip('week:T', title='Week of'),
+            alt.Tooltip('cases_per_100k:Q', title='Rate (/100k)', format='.1f'),
+          ],
+        )
+        .properties(height=320, title="Weekly rates among declining countries")
+      )
+      col_heat.altair_chart(heatmap, use_container_width=True)
+
+      line_countries = declining.sort_values('slope').head(3)['Country'].tolist()
+      line_df = section2_weekly_rates[
+        (section2_weekly_rates['Country'].isin(line_countries)) &
+        (section2_weekly_rates['week'] >= heatmap_start)
+      ]
+      lines = (
+        alt.Chart(line_df)
+        .mark_line(point=True)
+        .encode(
+          x='week:T',
+          y=alt.Y('cases_per_100k:Q', title='Rate (/100k)'),
+          color=alt.Color('Country:N', scale=alt.Scale(range=BLUE_SCALE)),
+          tooltip=['Country:N', 'week:T', alt.Tooltip('cases_per_100k:Q', format='.1f')],
+        )
+        .properties(height=320, title="Steepest 3 declines")
+      )
+      col_lines.altair_chart(lines, use_container_width=True)
+
+  with tab_stable:
+    st.subheader("Signals of stabilization")
+    metrics_col, chart_col = st.columns((1, 2))
+    metrics_col.metric(
+      "Days since last major spike",
+      f"{days_since_spike} days" if days_since_spike is not None else "n/a",
+      help="Days since global rolling 30-day cases were within the top quartile of post-2022 levels.",
+    )
+    metrics_col.metric(
+      "Current global CFR",
+      f"{current_cfr:.2f}%" if current_cfr is not None else "n/a",
+      help="Cumulative deaths / cumulative cases, post-2022 view.",
+    )
+
+    if post_peak_ts.empty:
+      chart_col.info("Decline-window slice unavailable for CFR comparison.")
+    else:
+      cfr_cases_chart = (
+        alt.layer(
+          alt.Chart(post_peak_ts)
+          .mark_line(color=SECONDARY_BLUE)
+          .encode(
+            x='Date_reported:T',
+            y=alt.Y('rolling30_cases:Q', title='30d avg new cases'),
+            tooltip=[
+              alt.Tooltip('Date_reported:T', title='Date'),
+              alt.Tooltip('rolling30_cases:Q', title='30d avg cases', format=',.0f'),
+            ],
+          ),
+          alt.Chart(post_peak_ts)
+          .mark_line(color=PRIMARY_BLUE)
+          .encode(
+            x='Date_reported:T',
+            y=alt.Y('cfr_pct:Q', title='CFR (%)', axis=alt.Axis(grid=False)),
+            tooltip=[
+              alt.Tooltip('Date_reported:T', title='Date'),
+              alt.Tooltip('cfr_pct:Q', title='CFR (%)', format='.2f'),
+            ],
+          ),
+        )
+        .resolve_scale(y='independent')
+        .properties(height=320, title="Post-2022 global cases vs CFR")
+      )
+      chart_col.altair_chart(cfr_cases_chart, use_container_width=True)
+
+    selected_regions_stable = st.multiselect(
+      "Surface low-variance countries",
+      options=region_options,
+      default=region_options,
+      key="stable_regions",
+    )
+    stable_table = stabilization_metrics.copy()
+    if selected_regions_stable:
+      stable_table = stable_table[stable_table['WHO_region'].isin(selected_regions_stable)]
+    stable_table = stable_table.replace([np.inf, -np.inf], np.nan)
+    stable_table = stable_table.dropna(subset=['variance_index'])
+    stable_show = stable_table.nsmallest(10, 'variance_index')
+
+    st.markdown("**Most stable weekly patterns since 2022** (lower variance = flatter curve)")
+    st.dataframe(
+      stable_show[['Country', 'WHO_region', 'variance_index', 'mean_weekly']],
+      use_container_width=True,
+    )
+
+
+st.sidebar.title("Navigation")
+st.sidebar.caption("Toggle between the crisis phase and the endemic transition.")
+section_choice = st.sidebar.radio("Story sections", SECTION_TITLES, index=0)
+if section_choice == SECTION_TITLES[0]:
+  render_section_one()
+else:
+  render_section_two()
 
