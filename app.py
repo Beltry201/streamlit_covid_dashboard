@@ -456,12 +456,30 @@ def render_section_one():
 
     if selected_countries:
       filtered = weekly_spread[weekly_spread['Country'].isin(selected_countries)]
+      
+      metadata_totals = TABLE_DATA.copy()
+      metadata_totals['total_cases'] = pd.to_numeric(
+        metadata_totals['Cases - cumulative total'], errors='coerce'
+      ).fillna(0)
+      country_totals = (
+        metadata_totals[metadata_totals['Country'].isin(selected_countries)]
+        [['Country', 'total_cases']]
+        .sort_values('total_cases', ascending=False)
+      )
+      country_order = country_totals['Country'].tolist()
+      
       spread_chart = alt.Chart(filtered).mark_line().encode(
         x='week:T',
         y=alt.Y('New_cases:Q', title='Weekly new cases'),
-        color=alt.Color('Country:N', scale=alt.Scale(range=BLUE_SCALE)),
+        color=alt.Color(
+          'Country:N',
+          scale=alt.Scale(domain=country_order, range=BLUE_SCALE),
+          sort=country_order,
+        ),
+        order=alt.Order('Country:N', sort='descending'),
         tooltip=['Country:N', 'week:T', alt.Tooltip('New_cases:Q', format=',')],
       ).properties(height=300)
+      
       col_a.altair_chart(spread_chart, use_container_width=True)
     else:
       col_a.info("Select at least one country to display weekly trends.")
@@ -535,195 +553,80 @@ def render_section_two():
       .mark_rule(color=PRIMARY_BLUE, strokeDash=[6, 4])
       .encode(x='Date_reported:T')
     )
-    st.altair_chart(decline_area + peak_marker, use_container_width=True)
+    jan2023_marker = (
+      alt.Chart(pd.DataFrame({'Date_reported': [pd.Timestamp('2023-01-01')]}))
+      .mark_rule(color="#ef4444", strokeDash=[3, 3])
+      .encode(x='Date_reported:T')
+    )
+    st.altair_chart(decline_area + peak_marker + jan2023_marker, use_container_width=True)
     st.caption(
       "Narrative focus: document the slope of the decline through 2024 to contextualize the subsequent tabs."
     )
 
   st.divider()
 
-  tab_high, tab_decline, tab_stable = st.tabs(
-    ["High circulation", "Declining signals", "Stabilization"]
+  st.subheader("Signals of stabilization")
+  metrics_col, chart_col = st.columns((1, 2))
+  metrics_col.metric(
+    "Days since last major spike",
+    f"{days_since_spike} days" if days_since_spike is not None else "n/a",
+    help="Days since global rolling 30-day cases were within the top quartile of post-2022 levels.",
+  )
+  metrics_col.metric(
+    "Current global CFR",
+    f"{current_cfr:.2f}%" if current_cfr is not None else "n/a",
+    help="Cumulative deaths / cumulative cases, post-2022 view.",
   )
 
-  with tab_high:
-    st.subheader("Where circulation remains high")
-    selected_regions_high = st.multiselect(
-      "Focus regions",
-      options=region_options,
-      default=region_options,
-      help="Filter the ranking to WHO regions of interest.",
-    )
-    if pd.isna(section2_latest_week):
-      st.info("Weekly aggregates unavailable for the decline window.")
-    else:
-      latest_label = section2_latest_week.strftime("%b %d, %Y")
-      latest_rates = section2_weekly_rates[section2_weekly_rates['week'] == section2_latest_week]
-      if selected_regions_high:
-        latest_rates = latest_rates[latest_rates['WHO_region'].isin(selected_regions_high)]
-
-      col_metrics, col_chart = st.columns((1, 2))
-      top_rates = latest_rates.dropna(subset=['cases_per_100k']).nlargest(10, 'cases_per_100k')
-
-      if not top_rates.empty:
-        avg_top5 = top_rates.head(5)['cases_per_100k'].mean()
-        col_metrics.metric(
-          "Avg top-5 rate (/100k)",
-          f"{avg_top5:.1f}",
-          help=f"Average weekly incidence among the five hottest spots ({latest_label}).",
-        )
-        col_metrics.metric(
-          "Regions represented",
-          f"{top_rates['WHO_region'].nunique()}",
-          help="Distinct WHO regions in the top-10 ranking.",
-        )
-
-        high_chart = (
-          alt.Chart(top_rates)
-          .mark_bar()
-          .encode(
-            x=alt.X('cases_per_100k:Q', title='Weekly new cases per 100k'),
-            y=alt.Y('Country:N', sort='-x'),
-            color=alt.Color('WHO_region:N', scale=alt.Scale(range=BLUE_SCALE)),
-            tooltip=[
-              'Country:N',
-              alt.Tooltip('cases_per_100k:Q', title='Rate (/100k)', format='.1f'),
-              alt.Tooltip('New_cases:Q', title='Weekly cases', format=','),
-              'WHO_region:N',
-            ],
-          )
-          .properties(height=350, title=f"Top circulation · week of {latest_label}")
-        )
-        col_chart.altair_chart(high_chart, use_container_width=True)
-      else:
-        col_chart.info("No weekly data available for the selected region(s).")
-
-  with tab_decline:
-    st.subheader("Sustained declines in new cases")
-    selected_regions_decline = st.multiselect(
-      "Highlight declines in regions",
-      options=region_options,
-      default=region_options,
-      key="decline_regions",
-    )
-    declining = negative_trends[
-      (negative_trends['is_declining']) &
-      (
-        negative_trends['WHO_region'].isin(selected_regions_decline)
-        if selected_regions_decline else True
-      )
-    ]
-    col_heat, col_lines = st.columns((2, 1))
-
-    if declining.empty:
-      col_heat.info("No countries meet the consecutive-week decline rule within the decline window.")
-    elif pd.isna(section2_latest_week):
-      col_heat.info("Weekly aggregates unavailable for decline tracking.")
-    else:
-      heatmap_countries = declining.sort_values('slope').head(8)['Country'].tolist()
-      heatmap_start = section2_latest_week - pd.Timedelta(weeks=6)
-      heatmap_df = section2_weekly_rates[
-        (section2_weekly_rates['Country'].isin(heatmap_countries)) &
-        (section2_weekly_rates['week'] >= heatmap_start)
-      ]
-      heatmap = (
-        alt.Chart(heatmap_df)
-        .mark_rect()
+  if post_peak_ts.empty:
+    chart_col.info("Decline-window slice unavailable for CFR comparison.")
+  else:
+    cfr_cases_chart = (
+      alt.layer(
+        alt.Chart(post_peak_ts)
+        .mark_line(color=SECONDARY_BLUE)
         .encode(
-          x=alt.X('week:T', title='Week'),
-          y=alt.Y('Country:N', sort=heatmap_countries),
-          color=alt.Color('cases_per_100k:Q', title='Rate (/100k)', scale=alt.Scale(scheme='blues')),
+          x='Date_reported:T',
+          y=alt.Y('rolling30_cases:Q', title='30d avg new cases'),
           tooltip=[
-            'Country:N',
-            alt.Tooltip('week:T', title='Week of'),
-            alt.Tooltip('cases_per_100k:Q', title='Rate (/100k)', format='.1f'),
+            alt.Tooltip('Date_reported:T', title='Date'),
+            alt.Tooltip('rolling30_cases:Q', title='30d avg cases', format=',.0f'),
           ],
-        )
-        .properties(height=320, title="Weekly rates among declining countries")
-      )
-      col_heat.altair_chart(heatmap, use_container_width=True)
-
-      line_countries = declining.sort_values('slope').head(3)['Country'].tolist()
-      line_df = section2_weekly_rates[
-        (section2_weekly_rates['Country'].isin(line_countries)) &
-        (section2_weekly_rates['week'] >= heatmap_start)
-      ]
-      lines = (
-        alt.Chart(line_df)
-        .mark_line(point=True)
+        ),
+        alt.Chart(post_peak_ts)
+        .mark_line(color=PRIMARY_BLUE)
         .encode(
-          x='week:T',
-          y=alt.Y('cases_per_100k:Q', title='Rate (/100k)'),
-          color=alt.Color('Country:N', scale=alt.Scale(range=BLUE_SCALE)),
-          tooltip=['Country:N', 'week:T', alt.Tooltip('cases_per_100k:Q', format='.1f')],
-        )
-        .properties(height=320, title="Steepest 3 declines")
+          x='Date_reported:T',
+          y=alt.Y('cfr_pct:Q', title='CFR (%)', axis=alt.Axis(grid=False)),
+          tooltip=[
+            alt.Tooltip('Date_reported:T', title='Date'),
+            alt.Tooltip('cfr_pct:Q', title='CFR (%)', format='.2f'),
+          ],
+        ),
       )
-      col_lines.altair_chart(lines, use_container_width=True)
-
-  with tab_stable:
-    st.subheader("Signals of stabilization")
-    metrics_col, chart_col = st.columns((1, 2))
-    metrics_col.metric(
-      "Days since last major spike",
-      f"{days_since_spike} days" if days_since_spike is not None else "n/a",
-      help="Days since global rolling 30-day cases were within the top quartile of post-2022 levels.",
+      .resolve_scale(y='independent')
+      .properties(height=320, title="Post-2022 global cases vs CFR")
     )
-    metrics_col.metric(
-      "Current global CFR",
-      f"{current_cfr:.2f}%" if current_cfr is not None else "n/a",
-      help="Cumulative deaths / cumulative cases, post-2022 view.",
-    )
+    chart_col.altair_chart(cfr_cases_chart, use_container_width=True)
 
-    if post_peak_ts.empty:
-      chart_col.info("Decline-window slice unavailable for CFR comparison.")
-    else:
-      cfr_cases_chart = (
-        alt.layer(
-          alt.Chart(post_peak_ts)
-          .mark_line(color=SECONDARY_BLUE)
-          .encode(
-            x='Date_reported:T',
-            y=alt.Y('rolling30_cases:Q', title='30d avg new cases'),
-            tooltip=[
-              alt.Tooltip('Date_reported:T', title='Date'),
-              alt.Tooltip('rolling30_cases:Q', title='30d avg cases', format=',.0f'),
-            ],
-          ),
-          alt.Chart(post_peak_ts)
-          .mark_line(color=PRIMARY_BLUE)
-          .encode(
-            x='Date_reported:T',
-            y=alt.Y('cfr_pct:Q', title='CFR (%)', axis=alt.Axis(grid=False)),
-            tooltip=[
-              alt.Tooltip('Date_reported:T', title='Date'),
-              alt.Tooltip('cfr_pct:Q', title='CFR (%)', format='.2f'),
-            ],
-          ),
-        )
-        .resolve_scale(y='independent')
-        .properties(height=320, title="Post-2022 global cases vs CFR")
-      )
-      chart_col.altair_chart(cfr_cases_chart, use_container_width=True)
+  selected_regions_stable = st.multiselect(
+    "Surface low-variance countries",
+    options=region_options,
+    default=region_options,
+    key="stable_regions",
+  )
+  stable_table = stabilization_metrics.copy()
+  if selected_regions_stable:
+    stable_table = stable_table[stable_table['WHO_region'].isin(selected_regions_stable)]
+  stable_table = stable_table.replace([np.inf, -np.inf], np.nan)
+  stable_table = stable_table.dropna(subset=['variance_index'])
+  stable_show = stable_table.nsmallest(10, 'variance_index')
 
-    selected_regions_stable = st.multiselect(
-      "Surface low-variance countries",
-      options=region_options,
-      default=region_options,
-      key="stable_regions",
-    )
-    stable_table = stabilization_metrics.copy()
-    if selected_regions_stable:
-      stable_table = stable_table[stable_table['WHO_region'].isin(selected_regions_stable)]
-    stable_table = stable_table.replace([np.inf, -np.inf], np.nan)
-    stable_table = stable_table.dropna(subset=['variance_index'])
-    stable_show = stable_table.nsmallest(10, 'variance_index')
-
-    st.markdown("**Most stable weekly patterns since 2022** (lower variance = flatter curve)")
-    st.dataframe(
-      stable_show[['Country', 'WHO_region', 'variance_index', 'mean_weekly']],
-      use_container_width=True,
-    )
+  st.markdown("**Most stable weekly patterns since 2022** (lower variance = flatter curve)")
+  st.dataframe(
+    stable_show[['Country', 'WHO_region', 'variance_index', 'mean_weekly']],
+    use_container_width=True,
+  )
 
 
 st.sidebar.title("Navigation")
