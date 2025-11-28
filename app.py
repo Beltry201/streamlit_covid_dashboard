@@ -85,8 +85,8 @@ st.set_page_config(layout="wide")
 
 DECLINE_END_DATE = pd.Timestamp('2024-12-31')
 SECTION_TITLES = (
-  "Section 1 · The Outbreak & Crisis Phase",
-  "Section 2 · From Peak to Plateau (2022–2024)",
+  "The Outbreak & Crisis Phase",
+  "From Peak to Plateau",
 )
 PROJECTION_DAYS = 20
 MIN_PROJECTION_GROWTH = 0.5
@@ -342,18 +342,6 @@ else:
 
 def render_section_one():
   st.title(SECTION_TITLES[0])
-  st.caption("Tracking how fast COVID-19 spread, how authorities reacted, and when the crisis peaked.")
-
-  with st.container():
-    st.subheader("Guiding Questions")
-    st.markdown(
-      "- How fast was COVID spreading per country and which countries were hit the hardest?\n"
-      "- How fast did authorities react (delay until the first reported case)?\n"
-      "- Which day recorded the worst global caseload?\n"
-      "- What would the curve look like without vaccinations?"
-    )
-
-  st.divider()
 
   metric_cols = st.columns(3)
   metric_cols[0].metric(
@@ -379,7 +367,7 @@ def render_section_one():
   tab_timeline, tab_countries = st.tabs(["Crisis Timeline", "Country Comparisons"])
 
   with tab_timeline:
-    st.subheader("Global new cases")
+    st.subheader("Covid-19 Global new cases")
     base = alt.Chart(global_ts).properties(height=350)
     layers = []
     if not no_action_projection.empty:
@@ -442,7 +430,7 @@ def render_section_one():
     st.altair_chart(alt.layer(*layers), use_container_width=True)
 
   with tab_countries:
-    st.subheader("Cases per country")
+    st.subheader("Covid-19 Cases per country")
     col_a, col_b = st.columns((2, 1))
 
     top_country_names = country_peaks.head(10)['Country'].tolist()
@@ -522,16 +510,6 @@ def render_section_two():
   st.caption(
     "Following the descent from the darkest day through late 2024 to spot lingering hotspots, sustained declines, and early signals of endemic stability."
   )
-
-  with st.container():
-    st.subheader("Guiding Questions")
-    st.markdown(
-      "- After the global peak, where did the virus remain stubbornly active?\n"
-      "- Which regions posted consistent week-over-week declines during 2023 Q3 – 2024 Q4?\n"
-      "- What evidence points to post-2022 stabilization (falling CFR, low-variance weeks)?"
-    )
-
-  st.divider()
 
   st.subheader(f"Come-down after the peak ({decline_window_label})")
   if post_peak_ts.empty:
@@ -629,8 +607,7 @@ def render_section_two():
   )
 
 
-st.sidebar.title("Navigation")
-st.sidebar.caption("Toggle between the crisis phase and the endemic transition.")
+st.sidebar.title("Covid-19 Pandemic")
 section_choice = st.sidebar.radio("Story sections", SECTION_TITLES, index=0)
 if section_choice == SECTION_TITLES[0]:
   render_section_one()
